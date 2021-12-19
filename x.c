@@ -711,21 +711,7 @@ bmotion(XEvent *e)
 void
 cresize(int width, int height)
 {
-	int col, row;
-
-	if (width != 0)
-		win.w = width;
-	if (height != 0)
-		win.h = height;
-
-	col = (win.w - 2 * borderpx) / win.cw;
-	row = (win.h - 2 * borderpx) / win.ch;
-	col = MAX(1, col);
-	row = MAX(1, row);
-
-	tresize(col, row);
-	xresize(col, row);
-	ttyresize(win.tw, win.th);
+	bgresize_req(width, height);
 }
 
 void
@@ -823,8 +809,11 @@ void
 xclear(int x1, int y1, int x2, int y2)
 {
 	XftDrawRect(xw.draw,
-			&dc.col[IS_SET(MODE_REVERSE)? defaultfg : defaultbg],
+			&dc.col[IS_SET(MODE_REVERSE)? defaultfg : 2],
 			x1, y1, x2-x1, y2-y1);
+	//XftDrawRect(xw.draw,
+			//&dc.col[IS_SET(MODE_REVERSE)? defaultfg : defaultbg],
+			//x1, y1, x2-x1, y2-y1);
 }
 
 void
@@ -1097,6 +1086,188 @@ xicdestroy(XIC xim, XPointer client, XPointer call)
 	return 1;
 }
 
+uint32_t *scale_image(uint32_t *buf, uint32_t w, uint32_t h, uint32_t new_w, uint32_t new_h)
+{
+	uint32_t
+		*re = malloc(new_w * new_h * sizeof(uint32_t)),
+		rx = ((w << 16) / new_w) + 1,
+		ry = ((h << 16) / new_h) + 1,
+		x2, y2;
+	for (uint32_t i = 0; i < new_h; i++) {
+		for (uint32_t j = 0; j < new_w; j++) {
+			x2 = j * rx >> 16;
+			y2 = i * ry >> 16;
+			re[i * new_w + j] = buf[y2 * w + x2];
+		}
+	}
+	return re;
+}
+
+typedef struct {
+	XImage *image;
+	uint32_t *original_bytes, *scaled_bytes;
+	int w, h, neww, newh;
+	uint64_t request_time;
+} Background;
+
+Background back = { 0 };
+//loat
+
+uint64_t time1000() {
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return now.tv_sec * 1e3 + now.tv_nsec / 1e6;
+}
+
+#define RESIZE_DELAY 100
+
+void selfping()
+{
+	XEvent event;
+	event.xclient.type = ClientMessage;
+	event.xclient.window = xw.win;
+	event.xclient.message_type = XInternAtom(xw.dpy, "DELAY_RESIZE", False);
+	event.xclient.format = 32;
+	event.xclient.data.l[0] = 1;
+	event.xclient.data.l[1] = 0;
+	if (fork() == 0) {
+		usleep(RESIZE_DELAY * 1000);
+		int e;
+		Display *d2 = XOpenDisplay(NULL);
+		e = XSendEvent(d2, xw.win, 1, 0, &event);
+	printf("(%i)--> %i", e, back.request_time);
+		e = XFlush(d2);
+	printf("<%i>.\n", e);
+		exit(0);
+	}
+}
+
+void delayed_resize() {
+	long T = time1000();
+	printf("<-- %i < %li  ", back.request_time, T - back.request_time);
+	// only handle the last request to avoid tearing
+	if (back.request_time + RESIZE_DELAY <= T) {
+		printf("finally\n");
+		int width = back.neww,
+			height = back.newh;
+		int col, row;
+
+		if (width != 0)
+			win.w = width;
+		if (height != 0)
+			win.h = height;
+
+		col = (win.w - 2 * borderpx) / win.cw;
+		row = (win.h - 2 * borderpx) / win.ch;
+		col = MAX(1, col);
+		row = MAX(1, row);
+printf("col %i row %i\n", col, row);
+printf("win.tw %i win.th %i\n", win.tw, win.th);
+		tresize(col, row);
+		xresize(col, row);
+		ttyresize(win.tw, win.th);
+printf("bgw %i bgh %i\n", back.neww, back.newh);
+		bgresize(back.neww, back.newh);
+		redraw();
+		//back.request_time = time1000();
+	}
+	else {
+		printf("not yet\n");
+	}
+}
+
+void bgresize_req(int w, int h) {
+	back.request_time = time1000();
+	back.neww = w;
+	back.newh = h;
+	selfping();
+}
+
+void bgresize(int w, int h) {
+	printf("bgresize(%i, %i)\n", w, h);
+	if (back.scaled_bytes) {
+		free(back.scaled_bytes);
+	}
+	back.scaled_bytes = scale_image(back.original_bytes, back.w, back.h, w, h);
+	back.image = XCreateImage(
+		xw.dpy, CopyFromParent, 24, ZPixmap, 0,
+		back.scaled_bytes,
+		w, h, 32, 0);
+	XInitImage(back.image);
+}
+
+#pragma pack(push, 1)
+typedef struct
+{
+	uint16_t magic;
+	uint32_t fsize;
+	uint32_t reserved, offset, hsize, w, h;
+	uint16_t planes, color;
+} BMP;
+#pragma pack(pop)
+
+void load_back(char *fn) {
+	// convert image -flip -colorspace sRGB -alpha reset image.bmp
+	//FILE *f = fopen("st-bgtest.rgb", "r");
+	FILE *f = fopen(fn, "r");
+	BMP bmp = {0};
+	fseek(f, 0L, SEEK_SET);
+	fread(&bmp, sizeof(bmp), 1, f);
+	unsigned char *p = &bmp;
+	for (int i = 0; i < sizeof(bmp); i++) {
+		printf("%x ", *p++);
+	}
+	printf("\n");
+	printf(" magic:%x\n", bmp.magic);
+	printf(" fsize:%i\n", bmp.fsize);
+	printf(" reserved:%x\n", bmp.reserved);
+	printf(" offset:%i\n", bmp.offset);
+	printf(" hsize:%i\n", bmp.hsize);
+	printf(" w:%i\n", bmp.w);
+	printf(" h:%i\n", bmp.h);
+	printf(" planes:%i\n", bmp.planes);
+	printf(" color:%i\n", bmp.color);
+
+	printf("\n");
+	#define A(x) ((char*)&x - (char*)&bmp)
+	printf(" magic:%i\n", A(bmp.magic));
+	printf(" fsize:%i\n", A(bmp.fsize));
+	printf(" reserved:%i\n", A(bmp.reserved));
+	printf(" offset:%i\n", A(bmp.offset));
+	printf(" hsize:%i\n", A(bmp.hsize));
+	printf(" w:%i\n", A(bmp.w));
+	printf(" h:%i\n", A(bmp.h));
+	printf(" planes:%i\n", A(bmp.planes));
+	printf(" color:%i\n", A(bmp.color));
+	fseek(f, bmp.offset, SEEK_SET);
+	if (bmp.color != 32) {
+		printf("Background image is not 32-bit\n");
+		exit(1);
+	}
+	back.w = bmp.w; back.h = bmp.h;
+	int count = bmp.w * bmp.h * bmp.color / 8;
+	unsigned char *a = (char*)malloc(count), *filebuf = a;
+	fread(filebuf, sizeof(char), count, f);
+	fclose(f);
+
+	back.original_bytes = filebuf;
+	double zoom = 1;
+	bgresize(back.w * zoom, back.h * zoom);
+
+	//
+	//uint32_t *b =
+		//back.original_bytes =
+			//malloc(back.w * back.h * 4);
+//
+	//for (int i = 0; i < back.w * back.h; i++) {
+		//*(uint32_t*)b = (a[0]<<16) + (a[1]<<8) + (a[2]);
+		//a += 3;
+		//b++;
+	//}
+	//free(filebuf);
+//
+}
+
 void
 xinit(int cols, int rows)
 {
@@ -1152,8 +1323,11 @@ xinit(int cols, int rows)
 			&gcvalues);
 	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
 			DefaultDepth(xw.dpy, xw.scr));
-	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
-	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
+
+	//XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
+	//XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
+	//XSetForeground(xw.dpy, dc.gc, dc.col[1].pixel);
+	//XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
 
 	/* font spec buffer */
 	xw.specbuf = xmalloc(cols * sizeof(GlyphFontSpec));
@@ -1208,6 +1382,8 @@ xinit(int cols, int rows)
 	xsel.xtarget = XInternAtom(xw.dpy, "UTF8_STRING", 0);
 	if (xsel.xtarget == None)
 		xsel.xtarget = XA_STRING;
+
+	load_back("/home/ya/bg/bg7.bmp");
 }
 
 int
@@ -1342,6 +1518,7 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 	return numspecs;
 }
 
+
 void
 xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, int y)
 {
@@ -1373,7 +1550,7 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 	}
 
 	if (IS_TRUECOL(base.bg)) {
-		colbg.alpha = 0xffff;
+		colbg.alpha = 0;//0xffff;
 		colbg.green = TRUEGREEN(base.bg);
 		colbg.red = TRUERED(base.bg);
 		colbg.blue = TRUEBLUE(base.bg);
@@ -1435,22 +1612,55 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 		fg = bg;
 
 	/* Intelligent cleaning up of the borders. */
+	int cfill = 0;
+	int bx[4] = {0}, by[4] = {0}, bh[4] = {0}, bw[4] = {0};
+
 	if (x == 0) {
-		xclear(0, (y == 0)? 0 : winy, borderpx,
-			winy + win.ch +
-			((winy + win.ch >= borderpx + win.th)? win.h : 0));
+		bx[0] = 0;
+		by[0] = (y == 0)? 0 : winy;
+		bw[0] = borderpx;
+		bh[0] = winy + win.ch + ((winy + win.ch >= borderpx + win.th)? win.h : 0);
 	}
 	if (winx + width >= borderpx + win.tw) {
-		xclear(winx + width, (y == 0)? 0 : winy, win.w,
-			((winy + win.ch >= borderpx + win.th)? win.h : (winy + win.ch)));
+		bx[1] = winx + width;
+		by[1] = (y == 0)? 0 : winy;
+		bw[1] = win.w;
+		bh[1] = (winy + win.ch >= borderpx + win.th)? win.h : (winy + win.ch);
 	}
-	if (y == 0)
-		xclear(winx, 0, winx + width, borderpx);
-	if (winy + win.ch >= borderpx + win.th)
-		xclear(winx, winy + win.ch, winx + width, win.h);
+	if (y == 0)	{
+		bx[2] = winx;
+		by[2] = 0;
+		bw[2] = winx + width;
+		bh[2] = borderpx;
+	}
+	if (winy + win.ch >= borderpx + win.th) {
+		bx[3] = winx;
+		by[3] = winy + win.ch;
+		bw[3] = winx + width;
+		bh[3] = win.h;
+	}
+
+	for (int f = 0; f < 4; f++) {
+		if (bw[f] > 0) {
+			if (cfill) xclear(bx[f], by[f], bw[f], bh[f]);
+			else XPutImage(xw.dpy, xw.buf, dc.gc, back.image, bx[f], by[f], bx[f], by[f], bw[f], bh[f]);
+		}
+	}
 
 	/* Clean up the region we want to draw to. */
-	XftDrawRect(xw.draw, bg, winx, winy, width, win.ch);
+//draf
+
+	if (base.bg != defaultbg) cfill = 1;
+	if (cfill) {
+		XftDrawRect(xw.draw, bg, winx, winy, width, win.ch);
+	}
+	else {
+		XPutImage(xw.dpy, xw.buf, dc.gc, back.image, winx, winy, winx, winy, width, win.ch);
+	}
+	//XCopyPlane(xw.dpy, bg_bitmap, xw.buf, dc.gc,
+		//winx, winy,
+		//width, win.ch,
+		//winx, winy, 1);
 
 	/* Set the clip region because Xft is sometimes dirty. */
 	r.x = 0;
@@ -1622,7 +1832,6 @@ xdrawline(Line line, int x1, int y1, int x2)
 	int i, x, ox, numspecs;
 	Glyph base, new;
 	XftGlyphFontSpec *specs = xw.specbuf;
-
 	numspecs = xmakeglyphfontspecs(specs, &line[x1], x2 - x1, x1, y1);
 	i = ox = 0;
 	for (x = x1; x < x2 && i < numspecs; x++) {
@@ -1853,6 +2062,10 @@ kpress(XEvent *ev)
 void
 cmessage(XEvent *e)
 {
+	if (e->xclient.message_type == XInternAtom(xw.dpy, "DELAY_RESIZE", False)) {
+		delayed_resize();
+		return;
+	}
 	/*
 	 * See xembed specs
 	 *  http://standards.freedesktop.org/xembed-spec/xembed-spec-latest.html
@@ -1936,8 +2149,9 @@ run(void)
 			XNextEvent(xw.dpy, &ev);
 			if (XFilterEvent(&ev, None))
 				continue;
-			if (handler[ev.type])
+			if (handler[ev.type]) {
 				(handler[ev.type])(&ev);
+			}
 		}
 
 		/*
@@ -2061,6 +2275,7 @@ run:
 	xinit(cols, rows);
 	xsetenv();
 	selinit();
+
 	run();
 
 	return 0;
